@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Вибрати на карті</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; background: #f0f2f5; }
+    #map { width: 100vw; height: calc(100vh - 120px); }
+    #controls {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      background: #fff;
+      padding: 12px 16px;
+      box-shadow: 0 -2px 8px rgba(0,0,0,0.15);
+      z-index: 1000;
+    }
+    #controls h3 { font-size: 14px; margin-bottom: 8px; color: #333; }
+    .mode-btns { display: flex; gap: 8px; margin-bottom: 8px; }
+    .mode-btn {
+      flex: 1; padding: 8px; border: 2px solid #ccc;
+      border-radius: 8px; background: #fff; cursor: pointer;
+      font-size: 13px; transition: all .2s;
+    }
+    .mode-btn.active { border-color: #3b82f6; background: #eff6ff; color: #1d4ed8; }
+    #info { font-size: 12px; color: #666; margin-bottom: 8px; min-height: 16px; }
+    #confirm-btn {
+      width: 100%; padding: 12px; background: #3b82f6; color: #fff;
+      border: none; border-radius: 10px; font-size: 15px;
+      cursor: pointer; font-weight: 600;
+    }
+    #confirm-btn:disabled { background: #93c5fd; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div id="controls">
+  <h3>Виберіть зону пошуку</h3>
+  <div class="mode-btns">
+    <button class="mode-btn active" id="btn-circle" onclick="setMode('circle')">⭕ Коло</button>
+    <button class="mode-btn" id="btn-bbox" onclick="setMode('bbox')">▭ Прямокутник</button>
+    <button class="mode-btn" id="btn-clear" onclick="clearSelection()">🗑 Очистити</button>
+  </div>
+  <div id="info">Натисніть на карту, щоб вибрати центр кола</div>
+  <button id="confirm-btn" disabled onclick="confirmSelection()">✅ Підтвердити</button>
+</div>
+
+<script>
+// ── Kyiv & Kyiv Oblast bounds ──────────────────────────────────────────────
+const BOUNDS = L.latLngBounds(
+  [49.2, 29.3],   // SW corner of Kyiv Oblast
+  [51.5, 32.2]    // NE corner of Kyiv Oblast
+);
+const KYIV_CENTER = [50.4501, 30.5234];
+
+// ── Telegram WebApp init ───────────────────────────────────────────────────
+const tg = window.Telegram?.WebApp;
+if (tg) {
+  tg.ready();
+  tg.expand();
+}
+
+// ── Map setup ─────────────────────────────────────────────────────────────
+const map = L.map('map', {
+  center: KYIV_CENTER,
+  zoom: 10,
+  maxBounds: BOUNDS,
+  maxBoundsViscosity: 1.0,
+});
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© OpenStreetMap contributors',
+  maxZoom: 18,
+}).addTo(map);
+
+// Kyiv Oblast boundary hint (visual only)
+L.rectangle(BOUNDS, { color: '#3b82f6', weight: 2, fillOpacity: 0.03 }).addTo(map);
+
+// ── State ─────────────────────────────────────────────────────────────────
+let mode = 'circle';   // 'circle' | 'bbox'
+let circleCenter = null, circle = null, circleRadiusKm = 5;
+let bboxStart = null, bboxRect = null;
+let dragging = false;
+
+// ── Mode switch ───────────────────────────────────────────────────────────
+function setMode(m) {
+  mode = m;
+  clearSelection();
+  document.getElementById('btn-circle').classList.toggle('active', m === 'circle');
+  document.getElementById('btn-bbox').classList.toggle('active', m === 'bbox');
+  setInfo(m === 'circle'
+    ? 'Натисніть на карті — центр кола. Прокрутіть колесо або розтягніть для зміни радіусу.'
+    : 'Натисніть і тягніть для малювання прямокутника.');
+}
+
+function setInfo(msg) {
+  document.getElementById('info').textContent = msg;
+}
+
+function setConfirmEnabled(v) {
+  document.getElementById('confirm-btn').disabled = !v;
+}
+
+// ── Clamp to bounds ───────────────────────────────────────────────────────
+function clamp(latlng) {
+  const sw = BOUNDS.getSouthWest(), ne = BOUNDS.getNorthEast();
+  return L.latLng(
+    Math.max(sw.lat, Math.min(ne.lat, latlng.lat)),
+    Math.max(sw.lng, Math.min(ne.lng, latlng.lng))
+  );
+}
+
+// ── Circle mode ───────────────────────────────────────────────────────────
+map.on('click', (e) => {
+  if (mode !== 'circle') return;
+  const pt = clamp(e.latlng);
+  circleCenter = pt;
+  drawCircle();
+  setInfo(`Центр: ${pt.lat.toFixed(4)}, ${pt.lng.toFixed(4)} | Радіус: ${circleRadiusKm} км`);
+  setConfirmEnabled(true);
+});
+
+// Scroll to resize circle
+map.on('wheel', (e) => {
+  if (mode !== 'circle' || !circleCenter) return;
+  const delta = e.originalEvent.deltaY > 0 ? -1 : 1;
+  circleRadiusKm = Math.max(1, Math.min(50, circleRadiusKm + delta));
+  drawCircle();
+  setInfo(`Радіус: ${circleRadiusKm} км`);
+});
+
+function drawCircle() {
+  if (circle) map.removeLayer(circle);
+  circle = L.circle(circleCenter, {
+    radius: circleRadiusKm * 1000,
+    color: '#3b82f6', fillOpacity: 0.15,
+  }).addTo(map);
+}
+
+// ── Bbox mode ─────────────────────────────────────────────────────────────
+map.on('mousedown', (e) => {
+  if (mode !== 'bbox') return;
+  bboxStart = clamp(e.latlng);
+  dragging = true;
+  map.dragging.disable();
+});
+
+map.on('mousemove', (e) => {
+  if (mode !== 'bbox' || !dragging) return;
+  const current = clamp(e.latlng);
+  drawBbox(bboxStart, current);
+});
+
+map.on('mouseup', (e) => {
+  if (mode !== 'bbox' || !dragging) return;
+  dragging = false;
+  map.dragging.enable();
+  const end = clamp(e.latlng);
+  drawBbox(bboxStart, end);
+  setConfirmEnabled(true);
+  setInfo('Прямокутник вибрано. Натисніть «Підтвердити».');
+});
+
+// Touch events for bbox
+map.on('touchstart', (e) => {
+  if (mode !== 'bbox') return;
+  bboxStart = clamp(e.latlng || map.containerPointToLatLng(e.originalEvent.touches[0]));
+  dragging = true;
+  map.dragging.disable();
+});
+map.on('touchend', (e) => {
+  if (mode !== 'bbox' || !dragging) return;
+  dragging = false;
+  map.dragging.enable();
+  setConfirmEnabled(true);
+});
+
+function drawBbox(a, b) {
+  if (bboxRect) map.removeLayer(bboxRect);
+  bboxRect = L.rectangle([a, b], {
+    color: '#3b82f6', fillOpacity: 0.15,
+  }).addTo(map);
+}
+
+// ── Clear ─────────────────────────────────────────────────────────────────
+function clearSelection() {
+  if (circle) { map.removeLayer(circle); circle = null; }
+  if (bboxRect) { map.removeLayer(bboxRect); bboxRect = null; }
+  circleCenter = null; bboxStart = null;
+  setConfirmEnabled(false);
+  setInfo(mode === 'circle'
+    ? 'Натисніть на карті — центр кола.'
+    : 'Натисніть і тягніть для прямокутника.');
+}
+
+// ── Confirm ───────────────────────────────────────────────────────────────
+function confirmSelection() {
+  let data = null;
+  if (mode === 'circle' && circleCenter) {
+    data = {
+      type: 'circle',
+      lat: parseFloat(circleCenter.lat.toFixed(6)),
+      lon: parseFloat(circleCenter.lng.toFixed(6)),
+      radius_km: circleRadiusKm,
+    };
+  } else if (mode === 'bbox' && bboxRect) {
+    const b = bboxRect.getBounds();
+    data = {
+      type: 'bbox',
+      min_lat: parseFloat(b.getSouth().toFixed(6)),
+      min_lon: parseFloat(b.getWest().toFixed(6)),
+      max_lat: parseFloat(b.getNorth().toFixed(6)),
+      max_lon: parseFloat(b.getEast().toFixed(6)),
+    };
+  }
+  if (!data) return;
+
+  if (tg) {
+    tg.sendData(JSON.stringify(data));
+  } else {
+    // Fallback for browser testing
+    alert('Data: ' + JSON.stringify(data));
+  }
+}
+
+setMode('circle');
+</script>
+</body>
+</html>
