@@ -7,10 +7,13 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@geoman-io/leaflet-geoman-free@2.16.0/dist/leaflet-geoman.css"/>
+  <script src="https://cdn.jsdelivr.net/npm/@geoman-io/leaflet-geoman-free@2.16.0/dist/leaflet-geoman.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: sans-serif; background: #f0f2f5; }
-    #map { width: 100vw; height: calc(100vh - 120px); }
+    /* 240px = worst-case controls height (223px with fields visible) + 17px buffer */
+    #map { width: 100vw; height: calc(100vh - 240px); }
     #controls {
       position: fixed; bottom: 0; left: 0; right: 0;
       background: #fff;
@@ -27,6 +30,19 @@
     }
     .mode-btn.active { border-color: #3b82f6; background: #eff6ff; color: #1d4ed8; }
     #info { font-size: 12px; color: #666; margin-bottom: 8px; min-height: 16px; }
+    .input-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+    .field-group { display: flex; flex-direction: column; flex: 1; min-width: 70px; }
+    .field-group label { font-size: 10px; color: #888; margin-bottom: 2px; }
+    .field-group input {
+      padding: 5px 6px; border: 1px solid #ccc; border-radius: 6px;
+      font-size: 12px; width: 100%;
+    }
+    .field-group input:focus { outline: none; border-color: #3b82f6; }
+    #debug-output {
+      display: none; font-size: 11px; color: #555;
+      word-break: break-all; margin-bottom: 6px;
+      padding: 6px; background: #f8f8f8; border-radius: 6px;
+    }
     #confirm-btn {
       width: 100%; padding: 12px; background: #3b82f6; color: #fff;
       border: none; border-radius: 10px; font-size: 15px;
@@ -44,19 +60,56 @@
     <button class="mode-btn" id="btn-bbox" onclick="setMode('bbox')">▭ Прямокутник</button>
     <button class="mode-btn" id="btn-clear" onclick="clearSelection()">🗑 Очистити</button>
   </div>
-  <div id="info">Натисніть на карту, щоб вибрати центр кола</div>
+  <div id="info"></div>
+
+  <div id="fields-circle" class="input-row" style="display:none">
+    <div class="field-group">
+      <label>Lat (центр)</label>
+      <input id="f-lat" type="number" step="0.0001" placeholder="50.4501">
+    </div>
+    <div class="field-group">
+      <label>Lon (центр)</label>
+      <input id="f-lon" type="number" step="0.0001" placeholder="30.5234">
+    </div>
+    <div class="field-group">
+      <label>Радіус (км)</label>
+      <input id="f-radius" type="number" step="1" min="1" max="50" placeholder="5">
+    </div>
+  </div>
+
+  <div id="fields-bbox" class="input-row" style="display:none">
+    <div class="field-group">
+      <label>min lat</label>
+      <input id="f-minlat" type="number" step="0.0001">
+    </div>
+    <div class="field-group">
+      <label>min lon</label>
+      <input id="f-minlon" type="number" step="0.0001">
+    </div>
+    <div class="field-group">
+      <label>max lat</label>
+      <input id="f-maxlat" type="number" step="0.0001">
+    </div>
+    <div class="field-group">
+      <label>max lon</label>
+      <input id="f-maxlon" type="number" step="0.0001">
+    </div>
+  </div>
+
+  <div id="debug-output"></div>
   <button id="confirm-btn" disabled onclick="confirmSelection()">✅ Підтвердити</button>
 </div>
 
 <script>
 // ── Kyiv & Kyiv Oblast bounds ──────────────────────────────────────────────
 const BOUNDS = L.latLngBounds(
-  [49.2, 29.3],   // SW corner of Kyiv Oblast
-  [51.5, 32.2]    // NE corner of Kyiv Oblast
+  [49.2, 29.3],
+  [51.5, 32.2]
 );
 const KYIV_CENTER = [50.4501, 30.5234];
 
 // ── Telegram WebApp init ───────────────────────────────────────────────────
+// tg declared before all functions so confirmSelection can safely check `if (tg)`
 const tg = window.Telegram?.WebApp;
 if (tg) {
   tg.ready();
@@ -76,26 +129,13 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 18,
 }).addTo(map);
 
-// Kyiv Oblast boundary hint (visual only)
 L.rectangle(BOUNDS, { color: '#3b82f6', weight: 2, fillOpacity: 0.03 }).addTo(map);
 
 // ── State ─────────────────────────────────────────────────────────────────
-let mode = 'circle';   // 'circle' | 'bbox'
-let circleCenter = null, circle = null, circleRadiusKm = 5;
-let bboxStart = null, bboxRect = null;
-let dragging = false;
+let mode = 'circle';
+let currentLayer = null;
 
-// ── Mode switch ───────────────────────────────────────────────────────────
-function setMode(m) {
-  mode = m;
-  clearSelection();
-  document.getElementById('btn-circle').classList.toggle('active', m === 'circle');
-  document.getElementById('btn-bbox').classList.toggle('active', m === 'bbox');
-  setInfo(m === 'circle'
-    ? 'Натисніть на карті — центр кола. Прокрутіть колесо або розтягніть для зміни радіусу.'
-    : 'Натисніть і тягніть для малювання прямокутника.');
-}
-
+// ── Utility ───────────────────────────────────────────────────────────────
 function setInfo(msg) {
   document.getElementById('info').textContent = msg;
 }
@@ -104,110 +144,144 @@ function setConfirmEnabled(v) {
   document.getElementById('confirm-btn').disabled = !v;
 }
 
-// ── Clamp to bounds ───────────────────────────────────────────────────────
-function clamp(latlng) {
-  const sw = BOUNDS.getSouthWest(), ne = BOUNDS.getNorthEast();
-  return L.latLng(
-    Math.max(sw.lat, Math.min(ne.lat, latlng.lat)),
-    Math.max(sw.lng, Math.min(ne.lng, latlng.lng))
-  );
+function showDebug(text) {
+  const el = document.getElementById('debug-output');
+  el.textContent = text;
+  el.style.display = text ? 'block' : 'none';
 }
 
-// ── Circle mode ───────────────────────────────────────────────────────────
-map.on('click', (e) => {
-  if (mode !== 'circle') return;
-  const pt = clamp(e.latlng);
-  circleCenter = pt;
-  drawCircle();
-  setInfo(`Центр: ${pt.lat.toFixed(4)}, ${pt.lng.toFixed(4)} | Радіус: ${circleRadiusKm} км`);
-  setConfirmEnabled(true);
-});
+// ── Geoman init ───────────────────────────────────────────────────────────
+function initDraw() {
+  map.pm.setGlobalOptions({ snappable: false, allowSelfIntersection: false });
 
-// Scroll to resize circle
-map.on('wheel', (e) => {
-  if (mode !== 'circle' || !circleCenter) return;
-  const delta = e.originalEvent.deltaY > 0 ? -1 : 1;
-  circleRadiusKm = Math.max(1, Math.min(50, circleRadiusKm + delta));
-  drawCircle();
-  setInfo(`Радіус: ${circleRadiusKm} км`);
-});
+  // pm:create fires when the user finishes drawing a shape.
+  // Source confirmed in src/js/Mixins/Events.js at v2.16.0 tag.
+  map.on('pm:create', (e) => {
+    if (currentLayer) {
+      currentLayer.pm.disable();
+      map.removeLayer(currentLayer);
+    }
+    currentLayer = e.layer;
 
-function drawCircle() {
-  if (circle) map.removeLayer(circle);
-  circle = L.circle(circleCenter, {
-    radius: circleRadiusKm * 1000,
-    color: '#3b82f6', fillOpacity: 0.15,
-  }).addTo(map);
+    // pm:change — fires during handle drag (confirmed for Rectangle in Edit.Rectangle.js v2.16.0).
+    //             For Circle, may only fire on pm:edit or pm:centerplaced.
+    // pm:edit   — fires after drag ends (confirmed for Rectangle; likely Circle via mixin).
+    // pm:centerplaced — fires when Circle center is moved (docs + Mixins/Events.js v2.16.0).
+    currentLayer.on('pm:change pm:edit pm:centerplaced', () => {
+      updateInputsFromLayer(currentLayer);
+    });
+
+    currentLayer.pm.enable({ allowSelfIntersection: false });
+    updateInputsFromLayer(currentLayer);
+    setConfirmEnabled(true);
+    map.pm.disableDraw();
+    setInfo('Редагуйте форму або вручну введіть координати. Потім «Підтвердити».');
+  });
 }
 
-// ── Bbox mode ─────────────────────────────────────────────────────────────
-map.on('mousedown', (e) => {
-  if (mode !== 'bbox') return;
-  bboxStart = clamp(e.latlng);
-  dragging = true;
-  map.dragging.disable();
-});
+// ── Map → input fields ────────────────────────────────────────────────────
+function updateInputsFromLayer(layer) {
+  // safeSet: skip a field if the user is currently focused on it
+  function safeSet(id, val) {
+    const el = document.getElementById(id);
+    if (el && el !== document.activeElement) el.value = val;
+  }
+  if (mode === 'circle') {
+    const c = layer.getLatLng();
+    const r = layer.getRadius() / 1000;
+    safeSet('f-lat',    c.lat.toFixed(4));
+    safeSet('f-lon',    c.lng.toFixed(4));
+    safeSet('f-radius', r.toFixed(1));
+  } else {
+    const b = layer.getBounds();
+    safeSet('f-minlat', b.getSouth().toFixed(4));
+    safeSet('f-minlon', b.getWest().toFixed(4));
+    safeSet('f-maxlat', b.getNorth().toFixed(4));
+    safeSet('f-maxlon', b.getEast().toFixed(4));
+  }
+}
 
-map.on('mousemove', (e) => {
-  if (mode !== 'bbox' || !dragging) return;
-  const current = clamp(e.latlng);
-  drawBbox(bboxStart, current);
-});
+// ── Input fields → map ────────────────────────────────────────────────────
+// 'change' fires on blur or Enter — once per field edit, not on every keypress.
+// pm.disable/enable runs once per field edit to reposition geoman's edit handles.
+// Programmatic .value = x (in updateInputsFromLayer) does NOT fire 'change',
+// so there is no feedback loop between this function and updateInputsFromLayer.
+function onInputChange() {
+  if (!currentLayer) return;
+  if (mode === 'circle') {
+    const lat = parseFloat(document.getElementById('f-lat').value);
+    const lon = parseFloat(document.getElementById('f-lon').value);
+    const r   = parseFloat(document.getElementById('f-radius').value);
+    if ([lat, lon, r].some(isNaN)) return;
+    if (lat < 49.0 || lat > 52.0 || lon < 28.0 || lon > 33.0) return;
+    if (r < 1 || r > 50) return;
+    currentLayer.pm.disable();
+    currentLayer.setLatLng([lat, lon]);
+    currentLayer.setRadius(r * 1000);
+    currentLayer.pm.enable({ allowSelfIntersection: false });
+  } else {
+    const minlat = parseFloat(document.getElementById('f-minlat').value);
+    const minlon = parseFloat(document.getElementById('f-minlon').value);
+    const maxlat = parseFloat(document.getElementById('f-maxlat').value);
+    const maxlon = parseFloat(document.getElementById('f-maxlon').value);
+    if ([minlat, minlon, maxlat, maxlon].some(isNaN)) return;
+    currentLayer.pm.disable();
+    currentLayer.setBounds([[minlat, minlon], [maxlat, maxlon]]);
+    currentLayer.pm.enable({ allowSelfIntersection: false });
+  }
+}
 
-map.on('mouseup', (e) => {
-  if (mode !== 'bbox' || !dragging) return;
-  dragging = false;
-  map.dragging.enable();
-  const end = clamp(e.latlng);
-  drawBbox(bboxStart, end);
-  setConfirmEnabled(true);
-  setInfo('Прямокутник вибрано. Натисніть «Підтвердити».');
-});
-
-// Touch events for bbox
-map.on('touchstart', (e) => {
-  if (mode !== 'bbox') return;
-  bboxStart = clamp(e.latlng || map.containerPointToLatLng(e.originalEvent.touches[0]));
-  dragging = true;
-  map.dragging.disable();
-});
-map.on('touchend', (e) => {
-  if (mode !== 'bbox' || !dragging) return;
-  dragging = false;
-  map.dragging.enable();
-  setConfirmEnabled(true);
-});
-
-function drawBbox(a, b) {
-  if (bboxRect) map.removeLayer(bboxRect);
-  bboxRect = L.rectangle([a, b], {
-    color: '#3b82f6', fillOpacity: 0.15,
-  }).addTo(map);
+// ── Mode switch ───────────────────────────────────────────────────────────
+// mode is set BEFORE clearSelection so clearSelection re-enables the correct draw tool.
+// setMode → clearSelection is one-way; clearSelection does NOT call setMode.
+function setMode(m) {
+  mode = m;
+  clearSelection();
+  document.getElementById('btn-circle').classList.toggle('active', m === 'circle');
+  document.getElementById('btn-bbox').classList.toggle('active', m === 'bbox');
+  document.getElementById('fields-circle').style.display = m === 'circle' ? 'flex' : 'none';
+  document.getElementById('fields-bbox').style.display   = m === 'bbox'   ? 'flex' : 'none';
 }
 
 // ── Clear ─────────────────────────────────────────────────────────────────
+// Called by: setMode (via button click) and the 🗑 button directly.
+// Does NOT call setMode or confirmSelection.
 function clearSelection() {
-  if (circle) { map.removeLayer(circle); circle = null; }
-  if (bboxRect) { map.removeLayer(bboxRect); bboxRect = null; }
-  circleCenter = null; bboxStart = null;
+  if (currentLayer) {
+    currentLayer.pm.disable();
+    map.removeLayer(currentLayer);
+    currentLayer = null;
+  }
   setConfirmEnabled(false);
-  setInfo(mode === 'circle'
-    ? 'Натисніть на карті — центр кола.'
-    : 'Натисніть і тягніть для прямокутника.');
+  showDebug('');
+  document.getElementById('fields-circle').querySelectorAll('input').forEach(el => el.value = '');
+  document.getElementById('fields-bbox').querySelectorAll('input').forEach(el => el.value = '');
+  map.pm.disableDraw();
+  if (mode === 'circle') {
+    map.pm.enableDraw('Circle', { continueDrawing: false, snappable: false });
+    setInfo('Намалюйте коло на карті.');
+  } else {
+    map.pm.enableDraw('Rectangle', { continueDrawing: false, snappable: false });
+    setInfo('Намалюйте прямокутник на карті.');
+  }
 }
 
 // ── Confirm ───────────────────────────────────────────────────────────────
+// Does NOT call setMode or clearSelection.
 function confirmSelection() {
+  if (!currentLayer) return;
   let data = null;
-  if (mode === 'circle' && circleCenter) {
+  if (mode === 'circle') {
+    const c = currentLayer.getLatLng();
+    const r = currentLayer.getRadius() / 1000;
     data = {
       type: 'circle',
-      lat: parseFloat(circleCenter.lat.toFixed(6)),
-      lon: parseFloat(circleCenter.lng.toFixed(6)),
-      radius_km: circleRadiusKm,
+      lat: parseFloat(c.lat.toFixed(6)),
+      lon: parseFloat(c.lng.toFixed(6)),
+      radius_km: Math.round(r * 10) / 10,
     };
-  } else if (mode === 'bbox' && bboxRect) {
-    const b = bboxRect.getBounds();
+  } else {
+    const b = currentLayer.getBounds();
     data = {
       type: 'bbox',
       min_lat: parseFloat(b.getSouth().toFixed(6)),
@@ -216,16 +290,27 @@ function confirmSelection() {
       max_lon: parseFloat(b.getEast().toFixed(6)),
     };
   }
-  if (!data) return;
-
+  const json = JSON.stringify(data);
+  if (json.length > 4096) {
+    showDebug('⚠️ JSON завеликий: ' + json.length + ' байт');
+    return;
+  }
   if (tg) {
-    tg.sendData(JSON.stringify(data));
+    tg.sendData(json);
   } else {
-    // Fallback for browser testing
-    alert('Data: ' + JSON.stringify(data));
+    showDebug('📤 Відправлено: ' + json);
   }
 }
 
+// ── Bind input change events ───────────────────────────────────────────────
+// 'change' fires on blur or Enter, not on every keystroke.
+['f-lat', 'f-lon', 'f-radius', 'f-minlat', 'f-minlon', 'f-maxlat', 'f-maxlon'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', onInputChange);
+});
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+initDraw();
 setMode('circle');
 </script>
 </body>
