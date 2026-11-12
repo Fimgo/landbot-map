@@ -115,6 +115,8 @@ if (tg) {
   tg.ready();
   tg.expand();
 }
+const _params = new URLSearchParams(window.location.search);
+const _filterId = _params.has('filter_id') ? parseInt(_params.get('filter_id'), 10) : null;
 
 // ── Map setup ─────────────────────────────────────────────────────────────
 const map = L.map('map', {
@@ -290,6 +292,7 @@ function confirmSelection() {
       max_lon: parseFloat(b.getEast().toFixed(6)),
     };
   }
+  if (_filterId !== null) data.filter_id = _filterId;
   const json = JSON.stringify(data);
   if (json.length > 4096) {
     showDebug('⚠️ JSON завеликий: ' + json.length + ' байт');
